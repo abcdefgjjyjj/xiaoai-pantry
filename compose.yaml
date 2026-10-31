@@ -1,0 +1,20 @@
+services:
+  pantry:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${PANTRY_BIND_IP:-127.0.0.1}:8768:8768"
+    volumes:
+      - pantry-data:/data
+      - pantry-backup:/backup
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8768/health',timeout=3).close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  pantry-data:
+  pantry-backup:

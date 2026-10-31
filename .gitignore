@@ -1,0 +1,27 @@
+# Runtime, credentials and per-household deployment files
+/private/
+/data/
+/backup/
+/backups/
+/exports/
+/secrets/
+*.sqlite*
+*.db
+*.db-*
+*.csv
+*.token
+.mi.token
+.env
+.env.*
+!.env.example
+*.log
+*.pem
+*.key
+/deploy-nas.ps1
+/run-nas.sh
+/open-pantry.ps1
+/打开家庭清单.cmd
+__pycache__/
+.ruff_cache/
+.venv/
+.pytest_cache/

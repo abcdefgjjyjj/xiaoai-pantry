@@ -1,0 +1,15 @@
+services:
+  pantry:
+    environment:
+      XIAOMUSIC_URL: ${XIAOMUSIC_URL:?Set the URL reachable from the container}
+      XIAOMUSIC_DID: ${XIAOMUSIC_DID:?Set the target speaker MIoT DID}
+      XIAOAI_KITCHEN_DID: ${XIAOAI_KITCHEN_DID:-}
+      XIAOMUSIC_TOKEN_FILE: /run/xiaomusic/.mi.token
+      XIAOAI_MI_TOKEN_FILE: /run/xiaomusic/.mi.token
+    volumes:
+      - type: bind
+        source: ${XIAOMUSIC_TOKEN_PATH:?Set the absolute path of the XiaoMusic login file}
+        target: /run/xiaomusic/.mi.token
+        read_only: true
+        bind:
+          create_host_path: false

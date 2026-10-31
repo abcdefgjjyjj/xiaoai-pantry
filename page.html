@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#174e44">
+<title>家庭保质期清单</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f4f6ef;color:#213b34;font:16px/1.55 system-ui,"Microsoft YaHei",sans-serif}main{max-width:800px;margin:auto;padding:26px 16px 60px}
+h1{font-size:clamp(26px,5vw,40px);margin:0;letter-spacing:-.03em}h2{font-size:19px;margin:0 0 12px}header{margin:12px 0 22px}header small{font-weight:650;color:#4f7768}p{margin:6px 0 12px}
+section,details{background:white;border:1px solid #dbe4d7;border-radius:16px;padding:18px;margin-bottom:14px}label,small,.muted{color:#51675c;font-size:14px}label{display:block;margin:8px 0}
+input,button{font:inherit;border:1px solid #b4c6b9;border-radius:9px;padding:8px 12px;max-width:100%}button{background:#f1f5ee;color:#214f42;cursor:pointer}button:hover{border-color:#327a65}button:disabled{opacity:.5;cursor:wait}.primary{background:#215f50;color:white;border-color:#215f50}
+form.flex,.controls,.times{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.flex input{flex:1 1 180px;min-width:0}.item{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 0;border-top:1px solid #e6eae1}.item strong{display:block;font-size:17px}.item .controls{justify-content:flex-end}.item button{padding:5px 9px;font-size:14px}
+.msg{border-radius:8px;background:#eef4ea;padding:9px 12px;margin-top:10px}.msg:empty{display:none}.badge{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:5px;background:#fff0d1;color:#7c4d12;font-size:12px}summary{cursor:pointer;font-weight:650}dl{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;font-size:14px}dt{color:#597066}dd{margin:0;overflow-wrap:anywhere}dialog{margin:auto;border:1px solid #b5c7b9;border-radius:14px;padding:20px}dialog::backdrop{background:#18261c55}[hidden]{display:none!important}@media(max-width:520px){.item{align-items:flex-start;flex-wrap:wrap}.item .controls{justify-content:start}}
+select{font:inherit;color:inherit;background:white;border:1px solid #b4c6b9;border-radius:9px;padding:8px 10px;max-width:100%}
+.filters,.fields{display:flex;gap:10px;flex-wrap:wrap;align-items:end}.filters{margin-bottom:12px}.filters input{flex:1;min-width:9em}.fields label{display:grid;gap:3px;margin:5px 0}.fields input{width:100%}.fields .wide{flex:1 1 14em}.fields .narrow{width:6em}.badge.expired{color:#8d3026;background:#fce7e2}.badge.review{color:#315d74;background:#e6f0f6}
+</style>
+<main>
+<header><small>小爱音箱 · 家庭库存</small><h1>保质期清单</h1></header>
+<section id="login" hidden><h2>连接家庭清单</h2><form class="flex" id="loginform"><input id="code" type="password" autocomplete="current-password" placeholder="输入家庭访问码" aria-label="家庭访问码" required><button class="primary">连接</button></form><p id="loginmsg" class="msg" role="status"></p></section>
+<div id="home" hidden>
+<section><h2>记一笔</h2><p class="muted">唤醒小爱后直接说「买了两盒酸奶，明天到期」。听到「已记录」或在清单看到商品，即表示登记成功。也可以在这里输入。</p><form class="flex" id="command"><input id="words" aria-label="库存指令" placeholder="菠菜，周日提醒我看看" maxlength="240" required><button class="primary">提交</button></form><p id="reply" class="msg" role="status"></p></section>
+<details><summary>填写商品入库</summary><form id="addform"><div class="fields">
+<label class="wide">名称<input id="itemname" required maxlength="60" placeholder="商品或物品名称"></label>
+<label class="narrow">数量<input id="itemqty" type="number" value="1" min="1" max="999" step="1" required></label>
+<label class="narrow">单位<input id="itemunit" value="件" maxlength="8" required></label>
+<label class="wide">存放位置（选填）<input id="itemlocation" list="places" maxlength="40" placeholder="例如：橱柜、卫生间"></label>
+<datalist id="places"></datalist>
+<label>日期用途<select id="itemkind"><option value="expiry">到期日</option><option value="check">提醒查看</option><option value="stock">只记库存</option></select></label>
+<label id="datelabel">日期<input id="itemdate" type="date" required></label>
+<button class="primary">保存入库</button></div><p class="msg" id="addmsg" role="status"></p></form></details>
+<section><button id="attention" type="button">查看待处理库存</button><h2 id="count">在库商品</h2><div class="filters"><input type="search" id="finditem" aria-label="按名称搜索" placeholder="按名称搜索库存"><select id="placefilter" aria-label="按存放位置筛选"></select><select id="statusfilter" aria-label="按日期状态筛选"></select></div><div id="rows"></div><a href="/api/export.csv" download>导出全部库存 CSV</a> <button id="undo" hidden>撤销最近一次变更</button></section>
+<details><summary>最近 20 次库存变更</summary><div id="activity"></div></details>
+<details><summary>厨房提醒设置</summary><form id="settings"><label><input type="checkbox" id="enabled"> 开启主动播报</label><p class="muted">在允许的时段，厨房持续有人满 2 分钟时，汇总全家各处需要提醒的商品。已用完的商品会自动剔除，每天最多播一次。</p><div class="times"><label>从 <input type="time" id="start" required></label><label>到 <input type="time" id="end" required></label></div><label>到期前 <input type="number" min="0" max="90" id="lead" style="width:5em" required> 天开始提醒。查看日当天提醒。</label><button>保存设置</button><p class="msg" id="settingsmsg" role="status"></p></form></details>
+<details><summary>设备状态与使用方法</summary><dl id="diagnostics"></dl><p class="muted">可以问「家里有什么快到期了」，或只问「橱柜里有什么」，也可以说「酸奶喝了一盒」。刚记下单批商品时，可以接着说「喝掉了一盒」或「改到周五」。</p><button id="share">复制家庭登录链接</button><p class="msg" id="sharemsg"></p></details>
+</div>
+<dialog id="edit"><form id="editform"><h2 id="edittitle"></h2><label id="editlabel" for="editvalue"></label><input id="editvalue" required><div class="controls" style="margin-top:12px"><button type="button" id="cancel">取消</button><button class="primary">确定</button></div></form></dialog>
+</main><script>
+const el=id=>document.getElementById(id), voiceLabels={voice:"音箱录入",presence:"厨房传感器",output:"音箱播报"};
+const unique=()=>crypto.randomUUID?.()||Date.now().toString(36)+Math.random().toString(36).slice(2);
+const channel=sessionStorage.getItem("pantryChannel")||unique();sessionStorage.setItem("pantryChannel",channel);
+let view,editing,settingsTouched=false,undoAvailable=false;
+async function api(path,body){const res=await fetch(path,body?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{cache:"no-store"});const value=await res.json();if(!res.ok){if(res.status===401){el("home").hidden=true;el("login").hidden=false}throw Error(value.error||"连接失败")}return value}
+function node(tag,txt,cls){const n=document.createElement(tag);n.textContent=txt;if(cls)n.className=cls;return n}
+const statuses={all:"全部",attention:"待处理",expired:"已过期",today:"今天到期",soon:"即将到期",review:"待查看",later:"日期尚早",undated:"未设日期"};
+function matchesStatus(row, selected){
+ if(selected==="all")return true;
+ if(selected==="attention")return ["expired","today","soon","review"].includes(row.status);
+ return row.status===selected;
+}
+function renderHistory(){
+ const history=el("activity");history.replaceChildren();
+ const labels={add:"入库",consume:"用掉",discard:"丢弃",date:"改期",location:"改位置",review_tomorrow:"明天再看",legacy:"历史变更"};
+ for(const entry of view.recent_changes){
+   const when=entry.created_at?new Date(entry.created_at*1000).toLocaleString("zh-CN",{timeZone:"Asia/Shanghai"}):"";
+   const items=entry.items.map(i=>i.name+(i.delta?" "+Math.abs(i.delta)+i.unit:"")+(i.location?" · "+i.location:"")+((entry.action==="date"||entry.action==="review_tomorrow")?" · "+i.due:"")).join("、");
+   history.append(node("p",(entry.undone?"已撤销 · ":"")+labels[entry.action]+" · "+items+" "+when));
+ }
+ if(!view.recent_changes.length)history.append(node("p","暂无变更。","muted"));
+}
+function renderRows(){
+ const filter=el("statusfilter"),selected=filter.value||"all",query=el("finditem").value.trim().toLowerCase();
+ const placeFilter=el("placefilter"),place=placeFilter.value||"*";
+ const places=[...new Set(view.rows.map(r=>r.location).filter(Boolean))].sort();
+ if(places.some(p=>["冰箱冷藏室","冰箱冷冻室"].includes(p))&&!places.includes("冰箱"))places.unshift("冰箱");
+ placeFilter.replaceChildren(new Option("全部位置","*"),new Option("未指定位置","-"),...places.map(p=>new Option(p,"loc:"+p)));
+ placeFilter.value=[...placeFilter.options].some(o=>o.value===place)?place:"*";
+ el("places").replaceChildren(...[...new Set(["冰箱","冰箱冷藏室","冰箱冷冻室","橱柜","储物间","卫生间","药箱",...places])].map(p=>new Option(p,p)));
+ const pool=view.rows.filter(r=>r.name.toLowerCase().includes(query)&&(placeFilter.value==="*"||(placeFilter.value==="-"?!r.location:(r.location===placeFilter.value.slice(4)||(placeFilter.value==="loc:冰箱"&&["冰箱冷冻室","冰箱冷藏室"].includes(r.location))))));
+ filter.replaceChildren(...Object.entries(statuses).map(([k,v])=>new Option(v+" ("+pool.filter(r=>matchesStatus(r,k)).length+")",k)));
+ filter.value=selected;
+ const rows=pool.filter(r=>matchesStatus(r,selected));
+ el("attention").textContent="查看待处理库存（"+view.rows.filter(r=>matchesStatus(r,"attention")).length+" 批）";el("count").textContent=(selected==="attention"?"待处理":"在库商品")+" · "+new Set(rows.map(r=>r.name)).size+" 种 / "+rows.length+" 批";
+ el("rows").replaceChildren();
+ if(!rows.length)el("rows").append(node("p",view.rows.length?"没有符合当前条件的商品。":"清单是空的。可以告诉小爱，或在上方填写第一件商品。","muted"));
+ for(const r of rows){const wrap=node("div","","item"),left=node("div",""),controls=node("div","","controls");left.append(node("strong",r.name+" · "+r.qty+r.unit));left.append(node("small",(r.location||"未指定位置")+" · "));left.append(node("small",r.kind==="stock"?"未设日期":r.due+" "+(r.kind==="expiry"?"到期":"查看")));if(["expired","today","soon","review"].includes(r.status))left.append(node("span",statuses[r.status],"badge "+r.status));
+ for(const [op,title] of [["consume","用掉"],["date",r.kind==="stock"?"设置到期日":"改期"],["location","改位置"],["discard","丢弃"]]){const b=node("button",title);b.onclick=()=>edit(r,op);controls.append(b)}
+ if(r.status==="review"){
+   const b=node("button","明天再看");
+   b.onclick=async()=>{b.disabled=true;try{await mutate("/api/batch",{batch:r.id,op:"review_tomorrow"})}catch(err){el("reply").textContent=err.message}finally{b.disabled=false}};
+   controls.append(b)
+ }
+ wrap.append(left,controls);el("rows").append(wrap)}
+}
+el("attention").onclick=()=>{el("finditem").value="";el("placefilter").value="*";el("statusfilter").value="attention";renderRows()};
+el("placefilter").onchange=renderRows;el("finditem").oninput=renderRows;el("statusfilter").onchange=renderRows;
+async function refresh(){view=await api("/api/state");el("home").hidden=false;el("login").hidden=true;renderRows();renderHistory();
+ el("undo").hidden=!(view.can_undo||undoAvailable);
+ if(!settingsTouched){el("enabled").checked=view.settings.enabled==="1";el("start").value=view.settings.start;el("end").value=view.settings.end;el("lead").value=view.settings.lead_days}
+ const diag=el("diagnostics");diag.replaceChildren();for(const [k,v] of Object.entries(view.devices)){diag.append(node("dt",voiceLabels[k]),node("dd",v))}diag.append(node("dt","最近语音指令"),node("dd",view.last_voice||"尚无记录"),node("dt","最近主动提醒"),node("dd",view.notice?view.notice.day+" · "+view.notice.state:"尚无记录"))}
+function edit(r,op){editing={r,op};const v=el("editvalue");el("edittitle").textContent=r.name+" · "+r.due;el("editlabel").textContent=op==="date"?"新的日期":(op==="discard"?"丢弃":"用掉")+"的数量（"+r.unit+"）";v.type=op==="date"?"date":"number";v.value=op==="date"?r.due:1;v.min=op==="date"?"":"1";v.max=op==="date"?"":r.qty;v.required=op!=="location";v.removeAttribute("list");if(op==="location"){el("editlabel").textContent="存放位置（留空表示未指定）";v.type="text";v.value=r.location||"";v.maxLength=40;v.setAttribute("list","places")}el("edit").showModal()}
+el("cancel").onclick=()=>el("edit").close();
+async function login(token){await api("/api/login",{token});sessionStorage.setItem("householdLink",token);await refresh()}
+el("loginform").onsubmit=async e=>{e.preventDefault();try{await login(el("code").value.trim());el("code").value=""}catch(err){el("loginmsg").textContent=err.message}};
+const pendingRequests=new Map();
+async function mutate(path,body){const key=JSON.stringify([path,body]),id=pendingRequests.get(key)||unique();pendingRequests.set(key,id);const value=await api(path,{...body,id,channel});el("reply").textContent=value.reply;await refresh();pendingRequests.delete(key);return value}
+function syncDate(){const hidden=el("itemkind").value==="stock";el("datelabel").hidden=hidden;el("itemdate").disabled=hidden}
+el("itemkind").onchange=syncDate;
+el("addform").onsubmit=async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{const r=await mutate("/api/add",{name:el("itemname").value.trim(),qty:Number(el("itemqty").value),unit:el("itemunit").value.trim(),location:el("itemlocation").value.trim(),kind:el("itemkind").value,due:el("itemdate").disabled?"":el("itemdate").value});e.target.reset();syncDate();el("addmsg").textContent=r.reply}catch(err){el("addmsg").textContent=err.message}finally{b.disabled=false}};
+el("command").onsubmit=async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{await mutate("/api/command",{text:el("words").value});el("words").value=""}catch(err){el("reply").textContent=err.message}finally{b.disabled=false}};
+el("editform").onsubmit=async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{await mutate("/api/batch",{batch:editing.r.id,op:editing.op,value:editing.op==="discard"?Number(el("editvalue").value):el("editvalue").value});el("edit").close()}catch(err){el("reply").textContent=err.message}finally{b.disabled=false}};
+el("undo").onclick=async()=>{if(confirm("撤销家庭清单最近一次库存变更？")){try{await mutate("/api/command",{text:"撤销"})}catch(err){el("reply").textContent=err.message}}};
+el("settings").oninput=()=>settingsTouched=true;el("settings").onsubmit=async e=>{e.preventDefault();try{const r=await api("/api/settings",{enabled:el("enabled").checked?"1":"0",start:el("start").value,end:el("end").value,lead_days:el("lead").value});settingsTouched=false;el("settingsmsg").textContent=r.reply;await refresh()}catch(err){el("settingsmsg").textContent=err.message}};
+el("share").onclick=async()=>{let t=sessionStorage.getItem("householdLink");if(!t){el("sharemsg").textContent="请使用家庭访问码重新登录，再复制登录链接。";return}const link=location.origin+"/#token="+encodeURIComponent(t);try{await navigator.clipboard.writeText(link);el("sharemsg").textContent="已复制。家庭成员连接家中网络后可打开。"}catch{prompt("复制家庭登录链接给家人",link)}};
+(async()=>{const token=new URLSearchParams(location.hash.slice(1)).get("token");if(location.hash)history.replaceState(null,"",location.pathname);try{if(token)await login(token);else await refresh()}catch(err){el("login").hidden=false;if(token)el("loginmsg").textContent=err.message}})();
+setInterval(()=>{if(!document.hidden&&!el("home").hidden&&!el("edit").open)refresh().catch(()=>{})},12000);
+</script></html>
