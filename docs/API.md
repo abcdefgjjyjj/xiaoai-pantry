@@ -12,6 +12,7 @@
 | GET /api/state | 需要 | 查询全部在库批次、设置和设备状态 |
 | GET /api/export.csv | 需要 | 下载全部在库批次，UTF-8 BOM、CSV 表头和按批次的数据，不受页面筛选影响。 |
 | POST /api/add | 需要 | 按字段新建一个批次 |
+| POST /api/catalog | 需要 | 按标准商品名新建或覆盖常买商品资料 |
 | POST /api/command | 需要 | 提交中文库存指令或接上一次追问 |
 | POST /api/batch | 需要 | 对一个批次扣减、改日期或改位置 |
 | POST /api/settings | 需要 | 保存整套提醒设置 |
@@ -51,7 +52,7 @@ $state.rows | Select-Object id,name,qty,unit,location,due,kind,status
 
 ## 写入与重试
 
-`/api/add`、`/api/command`、`/api/batch` 都必须传 `id`，建议使用 UUID（接收长度 8–160）。同一笔操作超时后，**保留同一个 ID 和原请求体重试**。服务按 ID 返回首次提交的答复。三个接口共用 Web ID 空间，跨端点、换商品或回答下一轮追问都应使用新 ID。服务不比较重复 ID 的请求内容。示例 ID 仅供本地练习。
+`/api/add`、`/api/command`、`/api/batch`、`/api/catalog` 都必须传 `id`，建议使用 UUID（接收长度 8–160）。同一笔操作超时后，**保留同一个 ID 和原请求体重试**。服务按 ID 返回首次提交的答复。四个接口共用 Web ID 空间，跨端点、换商品或回答下一轮追问都应使用新 ID。服务不比较重复 ID 的请求内容。示例 ID 仅供本地练习。
 
 写入统一返回 `{"reply":"…"}`，没有单独的 `created_id`。HTTP 200 也可能表示系统在追问、未找到商品或数量超出库存。需要确定结果时读 `reply` 并刷新 `/api/state`，不要假设最后一行是自己新增的批次。
 
@@ -61,7 +62,27 @@ $state.rows | Select-Object id,name,qty,unit,location,due,kind,status
 {"id":"demo-add-0001","name":"饼干","qty":2,"unit":"包","kind":"expiry","due":"2026-11-03","location":"橱柜"}
 ```
 
-`name` 为 1–60 个字符，`qty` 为 1–999 的 JSON 整数，`unit` 为 1–8 个字符。`kind` 与 `due` 必填。用 `expiry` 记录到期日，`check` 记录查看日，均传 `YYYY-MM-DD`。仅记数量时用 `"kind":"stock","due":""`。`location` 可省略或留空，最长 40 个字符。「冷藏室」「冷冻室」会归入冰箱相应分区。同商品再次入库会新增批次。
+`name` 为 1–60 个字符，也可用已登记的别名，或用字符串 `barcode` 代替 name。`qty` 为 1–999 的 JSON 整数，`unit` 最长 8 字，可省略（取主档单位，否则为「份」）。直接填日期时用 `expiry` 或 `check` 加 `due: "YYYY-MM-DD"`；只记数量用 `"kind":"stock","due":""`。位置最长 40 字，省略则优先采用主档位置。每次写入都是新批次。
+
+按生产日计算可提交：
+
+```json
+{"id":"demo-shelf-0001","barcode":"00123456","qty":2,"produced_on":"2026-10-20","shelf_value":30,"shelf_unit":"day"}
+```
+
+三项生产信息须一起传，不能同时指定非空 due；kind 仅可为 expiry 或省略。保质期是正整数，上限为 36500 天、1200 月或 100 年；生产日不能晚于上海当天。上例到期日为 11 月 19 日。月/年按日历相加，目标月没有同号日则取月末。批次返回原始三字段，直接填写日期时分别为 `""`、`0`、`""`。手动改期会清除计算依据，撤销改期可恢复。CSV 末尾追加生产日期、保质期数值和单位。
+
+### POST /api/catalog
+
+```json
+{"id":"demo-catalog-001","name":"早餐纯牛奶","unit":"盒","location":"橱柜","aliases":["小白奶","早餐奶"],"barcodes":["00123456"]}
+```
+
+先登记映射再按条码入库。按标准名保存整份资料：修改时连同要保留的别名、条码全部提交，空数组清除旧映射。各数组最多 32 项。条码是 8、12、13 或 14 位数字字符串，保留前导零；只作家庭内匹配，不验证商品真伪，也不查外部商品库。标准名、别名和条码共用唯一键，冲突返回 400，不覆盖其他商品。更新只影响未来录入。查询 `GET /api/state` 的 `catalog` 数组即可按名称、别名或条码查找。
+
+### 今天为什么没有提醒
+
+状态接口的 `reminder_today` 给出上海当地的 day、time、due_count、in_window、notice_state、headline、reasons、last_window_check。reasons 是当前阻碍的「稳定键 → 显示文案」对象：disabled、paused、no_items、quiet、unconfigured、waiting、sensor_error、unknown、stale、vacant、short_stay。可同时出现多项。已预留或已尝试时优先显示 notice_state；「已受理」是服务回执，不代表现场听到。last_window_check 是今日播报预留前、允许时段内最近的检查（day/time/headline/reasons 文案数组），没有记录则为 null。查询不会触发播报或写入检查历史。
 
 ### POST /api/command
 

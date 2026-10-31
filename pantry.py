@@ -7,6 +7,7 @@ import sqlite3
 import time
 from datetime import date, timedelta
 
+import catalog
 
 CN = "零〇一二两三四五六七八九十百"
 NUM = rf"(?:\d+|[{CN}]+)"
@@ -14,7 +15,7 @@ UNIT = "瓶盒袋包罐桶支管片块根把斤个份颗枚件提板卷打条杯
 DATE = re.compile(
     rf"(?:(?:{NUM})年)?(?:{NUM})月(?:{NUM})(?:日|号)?|"
     r"\d{4}-\d{1,2}-\d{1,2}|\d{1,2}/\d{1,2}|"
-    rf"(?:大后天|后天|明天|今天|月底|(?:(?:下|本|这)(?:个)?)?(?:星期|周|礼拜)[一二三四五六日天]|{NUM}天后)"
+    rf"(?:前天|昨天|大后天|后天|明天|今天|月底|(?:(?:下|本|这)(?:个)?)?(?:星期|周|礼拜)[一二三四五六日天]|{NUM}天后)"
 )
 CHECK = re.compile("提醒|看看|检查|查看")
 NO_DATE = re.compile(
@@ -29,15 +30,19 @@ PURCHASE = re.compile(
 NOT_STOCK = re.compile(
     r"不要|别记|没买|如果|假如|要是|假设|打算|准备买|想买|怎么买|能不能|能吃吗|可以吃吗|怎么保存|是什么意思|听歌|播放|开灯|关灯|闹钟|开会|取快递|订阅|会员|信用卡|还款|合同|车险|话费|流量包|优惠券|天气"
 )
-SCHEMA = """
+SCHEMA = (
+    """
 CREATE TABLE IF NOT EXISTS batches(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, qty INTEGER NOT NULL,
- unit TEXT NOT NULL, due TEXT NOT NULL, kind TEXT NOT NULL, location TEXT NOT NULL DEFAULT '');
+ unit TEXT NOT NULL, due TEXT NOT NULL, kind TEXT NOT NULL, location TEXT NOT NULL DEFAULT '',
+ produced_on TEXT NOT NULL DEFAULT '', shelf_value INTEGER NOT NULL DEFAULT 0, shelf_unit TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS changes(id INTEGER PRIMARY KEY, before_json TEXT NOT NULL, after_json TEXT NOT NULL, undone INTEGER DEFAULT 0, action TEXT NOT NULL DEFAULT '', created_at INTEGER);
 CREATE TABLE IF NOT EXISTS turns(id TEXT PRIMARY KEY, reply TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS pending(channel TEXT PRIMARY KEY, body TEXT NOT NULL, until REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS notices(day TEXT PRIMARY KEY,state TEXT NOT NULL,detail TEXT NOT NULL);
 """
+    + catalog.SCHEMA
+)
 
 
 def connect(path):
@@ -55,6 +60,13 @@ def initialize(db):
         db.execute("ALTER TABLE changes ADD COLUMN action TEXT NOT NULL DEFAULT ''")
     if "created_at" not in columns:
         db.execute("ALTER TABLE changes ADD COLUMN created_at INTEGER")
+    for field, ddl in (
+        ("produced_on", "TEXT NOT NULL DEFAULT ''"),
+        ("shelf_value", "INTEGER NOT NULL DEFAULT 0"),
+        ("shelf_unit", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if field not in {r["name"] for r in db.execute("PRAGMA table_info(batches)")}:
+            db.execute(f"ALTER TABLE batches ADD COLUMN {field} {ddl}")
 
 
 def location_name(value):
@@ -152,6 +164,8 @@ def number(s):
 
 
 def parse_date(s, today):
+    if s in ("昨天", "前天"):
+        return today - timedelta(days=1 if s == "昨天" else 2)
     if s in ("今天", "明天", "后天", "大后天"):
         return today + timedelta(days=("今天", "明天", "后天", "大后天").index(s))
     if s == "月底":
@@ -161,9 +175,7 @@ def parse_date(s, today):
     if re.search("周|星期|礼拜", s):
         target = "一二三四五六日".index(s[-1].replace("天", "日"))
         delta = target - today.weekday()
-        if s.startswith("下"):
-            delta += 7
-        elif delta < 0 and not s.startswith(("本", "这")):
+        if s.startswith("下") or delta < 0 and not s.startswith(("本", "这")):
             delta += 7
         return today + timedelta(days=delta)
     if "-" in s:
@@ -410,7 +422,8 @@ def natural_voice(db, text, channel="speaker"):
         return True
     if re.search("吗|能否|怎么买|怎么做|怎么吃|如何|多少钱", s):
         return False
-    matches = any(r["name"] in s for r in inventory(db))
+    query = catalog.expand_query(db, s)
+    matches = any(r["name"] in query for r in inventory(db))
     if matches and (
         CONSUME.search(s)
         or MOVE.search(s)
@@ -443,13 +456,15 @@ def undo(db):
     before, after = json.loads(row["before_json"]), json.loads(row["after_json"])
     for r in before + after:
         r.setdefault("location", "")
+        for key, value in SHELF_DEFAULTS.items():
+            r.setdefault(key, value)
     if any(row_for(db, r["id"]) != r for r in after):
         return "库存已经变化，请在清单中核对后修改。"
     for r in after:
         db.execute("DELETE FROM batches WHERE id=?", (r["id"],))
     for r in before:
         db.execute(
-            "INSERT INTO batches(id,name,qty,unit,due,kind,location) VALUES(:id,:name,:qty,:unit,:due,:kind,:location)",
+            "INSERT INTO batches(id,name,qty,unit,due,kind,location,produced_on,shelf_value,shelf_unit) VALUES(:id,:name,:qty,:unit,:due,:kind,:location,:produced_on,:shelf_value,:shelf_unit)",
             r,
         )
     db.execute("UPDATE changes SET undone=1 WHERE id=?", (row["id"],))
@@ -468,9 +483,11 @@ def product(text):
     text = text.strip(" ，,。；;：:")
     # Brand names can contain digits. Only count a number when followed by a unit.
     m = re.search(rf"({NUM})([{UNIT}])", text)
-    if len(re.findall(rf"{NUM}[{UNIT}]", text)) > 1 or re.search(r"[和、]|以及", text):
+    if len(re.findall(rf"{NUM}[{UNIT}]", text)) > 1 or re.search(
+        r"(?<=.)和|、|以及", text
+    ):
         raise ValueError("请把每种商品和它的日期分开说。")
-    qty, unit = (number(m[1]), m[2]) if m else (1, "份")
+    qty, unit = (number(m[1]), m[2]) if m else (1, "")
     if m:
         text = (text[: m.start()] + text[m.end() :].lstrip("的")).strip(" ，,")
     text = re.sub(
@@ -525,9 +542,57 @@ def spoken_add_receipt(db, entries, today):
     return "".join(parts)
 
 
+SHELF_DEFAULTS = {"produced_on": "", "shelf_value": 0, "shelf_unit": ""}
+
+
+def shelf_fields(produced, value, unit, today):
+    """Project convention: add whole days or calendar months; clamp to month end."""
+    if (
+        type(value) is not int
+        or not 1 <= value <= {"day": 36500, "month": 1200, "year": 100}.get(unit, 0)
+        or produced > today
+    ):
+        raise ValueError(
+            "请核对生产日期和保质期：生产日期不能晚于今天，保质期须为正整数且不超过约一百年。"
+        )
+    if unit == "day":
+        due = produced + timedelta(days=value)
+    else:
+        y, m = divmod(
+            produced.year * 12
+            + produced.month
+            - 1
+            + value * (12 if unit == "year" else 1),
+            12,
+        )
+        due = date(y, m + 1, min(produced.day, calendar.monthrange(y, m + 1)[1]))
+    return {
+        "produced_on": produced.isoformat(),
+        "shelf_value": value,
+        "shelf_unit": unit,
+        "due": due.isoformat(),
+        "kind": "expiry",
+    }
+
+
+def shopping_pieces(text):
+    # Only propagate a date when the speaker explicitly says it covers every item.
+    if re.search(r"(?:另外|还有|以及|和|、)$", text):
+        raise ValueError("请把最后一种商品说完整，这次没有入库。")
+    common = re.search(
+        rf"[，,]?(?:全部|全都|都)(?:是|在)?({DATE.pattern})(到期|过期)$", text
+    )
+    if common:
+        text = text[: common.start()]
+    boundary = rf"[；;。]|[，,、]?(?:另外还有|另外|还有|以及)|[，,、和](?=(?:又?买了)?{NUM}[{UNIT}])|(?:(?<=到期)|(?<=过期)|(?<=只记库存))(?:和|(?={NUM}[{UNIT}])|[，,、](?!放|存放|提醒|保质期|生产))"
+    if common:
+        boundary += r"|[、]|(?<=.)和"
+    pieces = [p.strip("，,、") for p in re.split(boundary, text) if p.strip("，,、")]
+    return [p + ("，" + common[1] + common[2] if common else "") for p in pieces]
+
+
 def add(db, text, today, channel):
-    # Only split multiple items after a complete date or an explicit semicolon.
-    pieces = re.split(r"[;；。](?=.)|[，,、]?\s*(?:另外还?有|还有)(?=.)", text)
+    pieces = shopping_pieces(text)
     entries = []
     for piece in filter(None, pieces):
         piece, location = take_location(piece)
@@ -537,12 +602,45 @@ def add(db, text, today, channel):
             piece = piece[2:]
             dates = list(DATE.finditer(piece))
         if re.search("生产|出厂", piece) or re.search(
-            rf"保质期(?:为)?{NUM}(?:天|个?月|年)", piece
+            rf"保质期(?:是|为)?{NUM}(?:天|个?月|年)", piece
         ):
-            return "请告诉我包装上的到期日期；如果只是想过几天查看，可以说「菠菜，三天后提醒我看看」。"
-        if len(dates) > 1:
+            marker = r"(?:生产日期|生产|出厂日期|出厂)"
+            prod = re.search(
+                rf"(?:{marker}(?:是|为|[:：])?({DATE.pattern})|({DATE.pattern})(?:的)?{marker})",
+                piece,
+            )
+            shelf = re.search(rf"保质期(?:是|为|[:：])?({NUM})(天|个?月|年)", piece)
+            if not prod or not shelf:
+                return "请同时说生产日期和保质期，例如「牛奶，10月20日生产，保质期30天」。这次没有入库。"
+            namepart = piece[: min(prod.start(), shelf.start())]
+            rest = (
+                piece[len(namepart) :].replace(prod[0], "", 1).replace(shelf[0], "", 1)
+            )
+            # A production date can also be an adjective: “一盒昨天生产的牛奶”.
+            between = piece[prod.end() : shelf.start()]
+            descriptor = re.fullmatch(r"的([^，,；;。]+)[，,]?", between)
+            if (
+                descriptor
+                and not piece[shelf.end() :].strip("，,")
+                and not DATE.search(descriptor[1])
+                and not re.search("到期|过期|生产|保质期", descriptor[1])
+            ):
+                namepart += descriptor[1]
+                rest = ""
+            if rest.strip("，,的"):
+                return "生产日期或保质期还有不明确的内容，这次没有入库。包装印有到期日时，可以只说到期日。"
+            produced = parse_date(prod[1] or prod[2], today)
+            name, qty, unit = product(namepart)
+            fields = shelf_fields(
+                produced,
+                number(shelf[1]),
+                {"天": "day", "月": "month", "个月": "month", "年": "year"}[shelf[2]],
+                today,
+            )
+            entries.append(dict(name=name, qty=qty, unit=unit, **fields))
+        elif len(dates) > 1:
             return "这句话里有多个日期，请分别说清每种商品和它的到期日或查看日。"
-        if dates:
+        elif dates:
             m = dates[0]
             name, qty, unit = product(piece[: m.start()])
             due = parse_date(m[0], today)
@@ -558,16 +656,28 @@ def add(db, text, today, channel):
                 else "expiry"
             )
             entries.append(
-                dict(name=name, qty=qty, unit=unit, due=due.isoformat(), kind=kind)
+                {
+                    "name": name,
+                    "qty": qty,
+                    "unit": unit,
+                    "due": due.isoformat(),
+                    "kind": kind,
+                }
             )
         elif NO_DATE.search(piece):
             name, qty, unit = product(NO_DATE.sub("", piece))
-            entries.append(dict(name=name, qty=qty, unit=unit, due="", kind="stock"))
+            entries.append(
+                {"name": name, "qty": qty, "unit": unit, "due": "", "kind": "stock"}
+            )
         else:
             name, qty, unit = product(piece)
             if len([p for p in pieces if p]) > 1:
                 return f"{name}还缺日期，这次没有入库。请补全后再一起说。"
-            prefix = f"{qty}{unit}{name}" + (f"，放在{location}" if location else "")
+            prefix = (
+                (f"{qty}{unit}" if unit else "")
+                + name
+                + (f"，放在{location}" if location else "")
+            )
             remember(db, channel, {"action": "date", "prefix": prefix})
             return f"{name}哪天到期，还是哪天提醒查看？也可以说「只记库存」。"
         entries[-1]["location"] = location
@@ -577,12 +687,22 @@ def add(db, text, today, channel):
 
 
 def save_entries(db, entries, today, channel):
+    entries = [dict(r) for r in entries]
+    for r in entries:
+        match = catalog.lookup(db, r["name"])
+        if match:
+            r["name"] = match["name"]
+            r["unit"] = r.get("unit") or match["unit"]
+            r["location"] = r.get("location") or match["location"]
+        elif catalog.barcode(catalog.key(r["name"])):
+            raise catalog.InputError("请先把这个条码绑定到常买商品，这次没有入库。")
+        r["unit"] = r.get("unit") or "份"
     receipt = spoken_add_receipt(db, entries, today) if channel == "speaker" else None
     after = []
     for r in entries:
         cur = db.execute(
-            "INSERT INTO batches(name,qty,unit,due,kind,location) VALUES(:name,:qty,:unit,:due,:kind,:location)",
-            {"location": "", **r},
+            "INSERT INTO batches(name,qty,unit,due,kind,location,produced_on,shelf_value,shelf_unit) VALUES(:name,:qty,:unit,:due,:kind,:location,:produced_on,:shelf_value,:shelf_unit)",
+            {**SHELF_DEFAULTS, "location": "", **r},
         )
         after.append(row_for(db, cur.lastrowid))
     save_change(db, [], after, "add")
@@ -603,7 +723,10 @@ def change(db, ident, op, value=None):
         )
     elif op == "date":
         kind = "expiry" if old["kind"] == "stock" else old["kind"]
-        db.execute("UPDATE batches SET due=?,kind=? WHERE id=?", (value, kind, ident))
+        db.execute(
+            "UPDATE batches SET due=?,kind=?,produced_on='',shelf_value=0,shelf_unit='' WHERE id=?",
+            (value, kind, ident),
+        )
     elif op == "location":
         db.execute(
             "UPDATE batches SET location=? WHERE id=?", (location_name(value), ident)
@@ -667,6 +790,14 @@ def interpret(db, raw, today, channel):
         return "今天的主动提醒已暂停，明天重新检查库存。"
     if s in ("连接检查", "测试连接", "测试", "能听见吗"):
         return "保质期管家已经连接。"
+    if PURCHASE.match(s) and not re.search("什么|多少|哪天|几号|吗|能否", s):
+        return add(db, s, today, channel)
+    if (
+        CONSUME.search(s)
+        or MOVE.search(s)
+        or re.search("什么时候|哪天|几号|还剩|还有几|多少|放在?哪|存在哪", s)
+    ):
+        s = catalog.expand_query(db, s)
     place = query_location(db, s)
     if re.search(r"放在?哪|存在哪", s):
         matches = [r for r in inventory(db) if r["name"] in s]

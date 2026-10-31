@@ -1,14 +1,19 @@
 """Regression tests for household speech and duplicate physical reminders."""
 
-import tempfile
 import csv
 import io
+import json
+import tempfile
+import threading
 import unittest
 from datetime import date, datetime
+from http.client import HTTPConnection
 from pathlib import Path
 from unittest.mock import patch
 
 import app
+import catalog
+import gateway
 import pantry
 import speaker
 
@@ -27,6 +32,243 @@ class HouseholdTests(unittest.TestCase):
     def utter(self, text, channel="speaker"):
         self.seq += 1
         return pantry.command(self.db, str(self.seq), text, self.today, channel)[0]
+
+    def test_http_catalog_shelf_replay_conflict_and_diagnosis(self):
+        with (
+            patch.object(app, "DB", self.path),
+            patch.object(app, "TOKEN", "local-test"),
+            app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler) as server,
+        ):
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+
+                def request(path, body=None, auth=True):
+                    conn = HTTPConnection("127.0.0.1", server.server_port, timeout=4)
+                    headers = {"Content-Type": "application/json"}
+                    if auth:
+                        headers["Authorization"] = "Bearer local-test"
+                    try:
+                        conn.request(
+                            "POST" if body is not None else "GET",
+                            path,
+                            None if body is None else json.dumps(body).encode(),
+                            headers,
+                        )
+                        resp = conn.getresponse()
+                        return resp.status, json.loads(resp.read())
+                    finally:
+                        conn.close()
+
+                p = {
+                    "id": "catalog-create",
+                    "name": "牙膏",
+                    "unit": "管",
+                    "location": "卫生间",
+                    "aliases": ["薄荷膏"],
+                    "barcodes": ["00123456"],
+                }
+                self.assertEqual(request("/api/catalog", p, False)[0], 401)
+                self.assertEqual(request("/api/catalog", p)[0], 200)
+                self.assertEqual(
+                    request(
+                        "/api/catalog", dict(p, id="catalog-conflict", name="另一款")
+                    )[0],
+                    400,
+                )
+                item = {
+                    "id": "purchase-1",
+                    "barcode": "00123456",
+                    "qty": 2,
+                    "produced_on": "2024-02-29",
+                    "shelf_value": 1,
+                    "shelf_unit": "year",
+                }
+                for _ in range(2):
+                    self.assertEqual(request("/api/add", item)[0], 200)
+                for change in [
+                    {"barcode": "99999999"},
+                    {"due": "2025-03-01"},
+                    {"shelf_value": True},
+                ]:
+                    self.assertEqual(
+                        request(
+                            "/api/add",
+                            dict(item, **change, id="invalid-" + str(len(change))),
+                        )[0],
+                        400,
+                    )
+                status, state = request("/api/state")
+                self.assertEqual(status, 200)
+                self.assertEqual(len(state["catalog"]), 1)
+                self.assertEqual(len(state["rows"]), 1)
+                row = state["rows"][0]
+                self.assertEqual(
+                    (row["due"], row["unit"], row["location"]),
+                    ("2025-02-28", "管", "卫生间"),
+                )
+                self.assertEqual(state["reminder_today"]["due_count"], 1)
+            finally:
+                server.shutdown()
+                thread.join(5)
+
+    def test_shelf_dates_provenance_and_manual_override(self):
+        raw = "买了两盒牛奶，10月20日生产，保质期30天"
+        self.assertTrue(pantry.natural_voice(self.db, raw))
+        self.assertIn("已记录", self.utter(raw))
+        r = pantry.inventory(self.db)[0]
+        self.assertEqual(
+            (r["due"], r["produced_on"], r["shelf_value"], r["shelf_unit"]),
+            ("2026-11-19", "2026-10-20", 30, "day"),
+        )
+        self.assertIn("已改期", self.utter("牛奶改到11月18日"))
+        self.assertFalse(pantry.row_for(self.db, r["id"])["produced_on"])
+        self.utter("撤销")
+        self.assertEqual(pantry.row_for(self.db, r["id"]), r)
+        for raw, expected in [
+            ("买了一盒面霜，生产日期是2024年2月29日，保质期一年", "2025-02-28"),
+            ("面霜，保质期为一个月，1月31日生产", "2026-02-28"),
+            ("买了一盒昨天生产的面霜，保质期2天", "2026-11-01"),
+        ]:
+            self.assertIn("已记录", self.utter(raw))
+            self.assertEqual(
+                self.db.execute(
+                    "SELECT due FROM batches ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0],
+                expected,
+            )
+        for raw in [
+            "牛奶，明天生产，保质期30天",
+            "牛奶，10月20日生产，保质期0天",
+            "牛奶，10月20日生产，保质期两年，明天到期",
+            "牛奶，保质期30天",
+            "牛奶，2月30日生产，保质期30天",
+        ]:
+            self.assertNotIn("已记录", self.utter(raw))
+        self.assertEqual(len(pantry.inventory(self.db)), 4)
+
+    def test_shopping_list_is_atomic_and_common_date_is_explicit(self):
+        for raw in [
+            "买了两盒牛奶明天到期一袋面包后天到期",
+            "买了两盒牛奶和一袋面包，都明天到期",
+            "两盒牛奶，10月20日生产，保质期30天，另外一管牙膏放在卫生间，只记库存",
+        ]:
+            before = len(pantry.inventory(self.db))
+            self.assertIn("已记录", self.utter(raw), raw)
+            self.assertEqual(len(pantry.inventory(self.db)), before + 2)
+        self.assertEqual(
+            [r[0] for r in self.db.execute("SELECT due FROM batches ORDER BY id")],
+            ["2026-11-01", "2026-11-02", "2026-11-01", "2026-11-01", "2026-11-19", ""],
+        )
+        for raw in [
+            "买了一盒牛奶和一袋面包，明天到期",
+            "买了一盒牛奶明天到期，还有一袋面包",
+            "买了一盒牛奶明天到期，还有",
+            "买了一盒牛奶明天到期，另外牙膏，2月30日到期",
+        ]:
+            self.assertNotIn("已记录", self.utter(raw), raw)
+        self.assertEqual(len(pantry.inventory(self.db)), 6)
+        self.utter("撤销", "web")
+        self.assertEqual(len(pantry.inventory(self.db)), 4)
+
+    def test_catalog_aliases_barcodes_separate_batches(self):
+        item = {
+            "name": "早餐纯牛奶",
+            "unit": "盒",
+            "aliases": ["小白奶"],
+            "barcodes": ["00123456"],
+        }
+        with self.db:
+            catalog.save(self.db, item, "橱柜")
+        self.assertEqual(catalog.listing(self.db)[0]["barcodes"], ["00123456"])
+        for raw in ["买了小白奶，明天到期", "买了一瓶00123456，放在书房，后天到期"]:
+            self.assertIn("已记录", self.utter(raw))
+        a, b = pantry.inventory(self.db)
+        self.assertEqual(
+            (a["name"], a["unit"], a["location"]), ("早餐纯牛奶", "盒", "橱柜")
+        )
+        self.assertEqual(
+            (b["name"], b["unit"], b["location"]), ("早餐纯牛奶", "瓶", "书房")
+        )
+        self.assertTrue(pantry.natural_voice(self.db, "小白奶还有多少"))
+        self.assertIn("早餐纯牛奶", self.utter("小白奶还有多少"))
+        self.utter("小白奶喝了一瓶")
+        self.assertEqual(pantry.inventory(self.db), [a])
+        self.assertNotIn(
+            "已记录", self.utter("一瓶牛奶明天到期，另外一箱12345678明天到期")
+        )
+        self.assertEqual(pantry.inventory(self.db), [a])
+        with self.assertRaises(catalog.InputError), self.db:
+            catalog.save(self.db, dict(item, name="其他牛奶"), "")
+        with self.db:
+            catalog.save(self.db, dict(item, aliases=["早餐奶"], barcodes=[]), "")
+        self.assertIsNone(catalog.lookup(self.db, "00123456"))
+        self.assertIsNone(catalog.lookup(self.db, "小白奶"))
+        self.assertEqual(pantry.inventory(self.db), [a])
+
+    @patch.dict(
+        "os.environ",
+        {"XIAOMUSIC_URL": "configured", "XIAOAI_KITCHEN_DID": "configured"},
+    )
+    def test_current_reasons_and_persisted_daytime_check(self):
+        noon = datetime(2026, 10, 31, 12, tzinfo=app.SHANGHAI)
+
+        def observation(occupied=True, minutes=2, age=0):
+            return (
+                "ok",
+                gateway.PresenceSample(
+                    occupied,
+                    int(noon.timestamp() - age),
+                    "",
+                    "fresh",
+                    duration_minutes=minutes,
+                ),
+            )
+
+        self.assertEqual(
+            set(
+                app.reminder_status(self.db, noon.replace(hour=23), observation())[0][
+                    "reasons"
+                ]
+            ),
+            {"no_items", "quiet", "stale"},
+        )
+        self.utter("一盒酸奶，明天到期")
+        for obs, code in [
+            (observation(False), "vacant"),
+            (observation(minutes=0), "short_stay"),
+            (observation(age=181), "stale"),
+            (observation(age=-1), "stale"),
+            (("error", None), "sensor_error"),
+        ]:
+            report = app.reminder_status(self.db, noon, obs)[0]
+            self.assertIn(code, report["reasons"])
+            self.assertIsNone(app.reserve_summary(self.db, noon, obs))
+        night = app.reminder_status(self.db, noon.replace(hour=22), observation())[0]
+        self.assertIn("读取失败", night["last_window_check"]["headline"])
+        self.assertIsNone(night["notice_state"])
+        self.assertIn("酸奶", app.reserve_summary(self.db, noon, observation()))
+        self.assertIsNone(app.reserve_summary(self.db, noon, observation()))
+        with self.db:
+            self.db.execute("UPDATE notices SET state='结果未确认'")
+        self.assertIn(
+            "不再重复", app.reminder_status(self.db, noon, observation())[0]["headline"]
+        )
+        nextday = app.reminder_status(
+            self.db, noon.replace(month=11, day=1), observation()
+        )[0]
+        self.assertIsNone(nextday["notice_state"])
+        self.assertIsNone(nextday["last_window_check"])
+
+    @patch.dict(
+        "os.environ",
+        {"XIAOMUSIC_URL": "configured", "XIAOAI_KITCHEN_DID": "configured"},
+    )
+    def reserve_occupied(self, db, dt):
+        sample = gateway.PresenceSample(
+            True, int(dt.timestamp()), "occupied", "fresh", duration_minutes=2
+        )
+        return app.reserve_summary(db, dt, ("ok", sample))
 
     def test_natural_language_without_prefix(self):
         def voice(text):
@@ -110,7 +352,7 @@ class HouseholdTests(unittest.TestCase):
         self.utter("橱柜里的牛奶喝完了")
         milk = [r for r in pantry.inventory(self.db) if r["name"] == "牛奶"]
         self.assertEqual([(r["location"], r["qty"]) for r in milk], [("冰箱冷藏室", 2)])
-        notice = app.reserve_summary(
+        notice = self.reserve_occupied(
             self.db, datetime(2026, 10, 31, 12, 0, tzinfo=app.SHANGHAI)
         )
         self.assertIn("卫生间", notice)
@@ -124,7 +366,14 @@ class HouseholdTests(unittest.TestCase):
             self.db.execute(
                 "CREATE TABLE batches(id INTEGER PRIMARY KEY, name TEXT, qty INTEGER, unit TEXT, due TEXT, kind TEXT)"
             )
-            old = dict(id=1, name="纸巾", qty=3, unit="包", due="", kind="stock")
+            old = {
+                "id": 1,
+                "name": "纸巾",
+                "qty": 3,
+                "unit": "包",
+                "due": "",
+                "kind": "stock",
+            }
             new = dict(old, qty=1)
             self.db.execute(
                 "INSERT INTO batches VALUES(:id,:name,:qty,:unit,:due,:kind)", new
@@ -136,7 +385,9 @@ class HouseholdTests(unittest.TestCase):
             pantry.initialize(self.db)
             pantry.initialize(self.db)
         self.assertIn("已撤销", self.utter("撤销", "web"))
-        self.assertEqual(pantry.row_for(self.db, 1), dict(old, location=""))
+        self.assertEqual(
+            pantry.row_for(self.db, 1), dict(old, location="", **pantry.SHELF_DEFAULTS)
+        )
 
     def test_review_and_discard_workflow_and_replay(self):
         self.utter("一把菠菜，今天提醒我看看")
@@ -169,14 +420,14 @@ class HouseholdTests(unittest.TestCase):
         self.assertIn("菠菜", self.utter("家里有哪些东西要处理"))
 
     def test_csv_export_round_trip_and_safe_spreadsheet_cells(self):
-        entry = dict(
-            name="=SUM(1,2)",
-            qty=2,
-            unit="盒",
-            location='书房,"柜子"',
-            due="",
-            kind="stock",
-        )
+        entry = {
+            "name": "=SUM(1,2)",
+            "qty": 2,
+            "unit": "盒",
+            "location": '书房,"柜子"',
+            "due": "",
+            "kind": "stock",
+        }
         pantry.transact(
             self.db,
             "export-fixture",
@@ -234,16 +485,16 @@ class HouseholdTests(unittest.TestCase):
     def test_quiet_window_and_persistent_daily_reservation(self):
         self.utter("一盒豆腐，明天到期")
         dt = datetime(2026, 10, 31, 22, 0, tzinfo=app.SHANGHAI)
-        self.assertIsNone(app.reserve_summary(self.db, dt))
+        self.assertIsNone(self.reserve_occupied(self.db, dt))
         dt = dt.replace(hour=12)
-        self.assertIn("豆腐", app.reserve_summary(self.db, dt))
+        self.assertIn("豆腐", self.reserve_occupied(self.db, dt))
         other = pantry.connect(self.path)
         try:
-            self.assertIsNone(app.reserve_summary(other, dt))
+            self.assertIsNone(self.reserve_occupied(other, dt))
         finally:
             other.close()
         self.utter("豆腐吃完了")
-        self.assertIsNone(app.reserve_summary(self.db, dt.replace(month=11, day=1)))
+        self.assertIsNone(self.reserve_occupied(self.db, dt.replace(month=11, day=1)))
 
     def test_stock_without_date_and_distinct_reminder_status(self):
         self.utter("买了两卷纸巾")
@@ -283,7 +534,7 @@ class HouseholdTests(unittest.TestCase):
             self.assertIn(included, answer)
             for name in excluded:
                 self.assertNotIn(name, answer)
-        notice = app.reserve_summary(
+        notice = self.reserve_occupied(
             self.db, datetime(2026, 10, 31, 12, 0, tzinfo=app.SHANGHAI)
         )
         self.assertIn("已过期", notice)

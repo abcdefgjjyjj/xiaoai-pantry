@@ -2,6 +2,7 @@
 !Dockerfile
 !app.py
 !pantry.py
+!catalog.py
 !gateway.py
 !speaker.py
 !backup.py

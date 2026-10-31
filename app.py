@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import catalog
 import pantry
 
 DATA = Path(os.getenv("PANTRY_DATA_DIR", str(Path(__file__).parent / "data")))
@@ -25,6 +26,7 @@ HOST = os.getenv("PANTRY_HOST", "127.0.0.1")
 PORT = int(os.getenv("PANTRY_PORT", "8768"))
 TOKEN = ""
 HEALTH = {"voice": "等待首次读取", "presence": "等待首次读取", "output": "等待调用"}
+PRESENCE = ("waiting", None)
 PREFIXES = ("保质期管家", "保质期助手")
 PAGE = Path(__file__).with_name("page.html")
 DEFAULT = {"enabled": "1", "start": "09:00", "end": "20:00", "lead_days": "2"}
@@ -46,7 +48,7 @@ def log_failure(component, exc):
     # Device libraries may include signed URLs in exception messages.
     msg = "暂不可用（" + type(exc).__name__ + "）"
     if HEALTH.get(component) != msg:
-        logging.warning("%s: %s", component, type(exc).__name__)
+        logging.getLogger(__name__).warning("%s: %s", component, type(exc).__name__)
     status(component, msg)
 
 
@@ -97,7 +99,7 @@ def voice_step(db, since, seen=None):
                 )
             try:
                 say(msg)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - isolate adapter/request failures without logging secrets
                 log_failure("output", exc)
     latest = speaker.last_record_time
     last_seen = (
@@ -125,28 +127,88 @@ def voice_loop():
             try:
                 since = voice_step(db, since, seen)
                 failures = 0
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - isolate adapter/request failures without logging secrets
                 log_failure("voice", exc)
                 failures = min(failures + 1, 4)
                 delay = 30 * 2 ** (failures - 1)
             time.sleep(delay)
 
 
-def reserve_summary(db, dt):
+def reminder_status(db, dt, observation=None):
+    """Read-only explanation, using the same conditions as the reminder worker."""
+    from gateway import MAX_AGE
+
     day = dt.date().isoformat()
-    localtime = dt.strftime("%H:%M")
+    cfg = settings(db)
+    clock = dt.strftime("%H:%M")
+    in_window = cfg["start"] <= clock < cfg["end"]
+    rows = pantry.due_items(db, dt.date())
+    reasons = {}
+    if cfg["enabled"] != "1":
+        reasons["disabled"] = "主动播报已关闭"
+    if pantry.get_setting(db, "skip_day") == day:
+        reasons["paused"] = "今天已暂停主动提醒"
+    if not rows:
+        reasons["no_items"] = "没有到期、临期或到查看日的在库批次"
+    if not in_window:
+        reasons["quiet"] = f"当前不在允许播报时段（{cfg['start']}–{cfg['end']}）"
+    observation = PRESENCE if observation is None else observation
+    mode, sample = observation
+    if not os.getenv("XIAOMUSIC_URL") or not os.getenv("XIAOAI_KITCHEN_DID"):
+        reasons["unconfigured"] = "未配置厨房传感器或音箱接入"
+    elif mode == "error":
+        reasons["sensor_error"] = "厨房传感器读取失败，等待下次检查"
+    elif sample is None:
+        reasons["waiting"] = "等待厨房传感器首次上报"
+    elif sample.reason in ("conflicting_reports", "no_valid_status"):
+        reasons["unknown"] = "厨房传感器状态冲突或缺失"
+    elif (
+        sample.updated_at is None
+        or not 0 <= dt.timestamp() - sample.updated_at <= MAX_AGE
+        or sample.occupied is None
+    ):
+        reasons["stale"] = "厨房没有有效的近期上报，无法判断是否有人"
+    elif not sample.occupied:
+        reasons["vacant"] = "厨房当前无人"
+    elif sample.duration_minutes < 2:
+        reasons["short_stay"] = "厨房有人，等待传感器确认已满 2 分钟"
+    notice = db.execute("SELECT state FROM notices WHERE day=?", (day,)).fetchone()
+    state = notice[0] if notice else None
+    headline = {
+        "准备播报": "今天已登记播报尝试，尚无发送结果",
+        "结果未确认": "今天已尝试播报，音箱结果未确认，不再重复发送",
+        "音箱服务已受理": "今天的提醒已被音箱服务受理",
+    }.get(state)
+    last = json.loads(pantry.get_setting(db, "window_check", "null"))
+    return {
+        "day": day,
+        "time": clock,
+        "due_count": len(rows),
+        "in_window": in_window,
+        "notice_state": state,
+        "reasons": reasons,
+        "headline": headline
+        or next(iter(reasons.values()), "条件已满足，等待下一次检查"),
+        "last_window_check": last if last and last["day"] == day else None,
+    }, rows
+
+
+def reserve_summary(db, dt, observation=None):
+    day = dt.date().isoformat()
     db.execute("BEGIN IMMEDIATE")
     try:
-        cfg = settings(db)
-        if (
-            cfg["enabled"] != "1"
-            or not cfg["start"] <= localtime < cfg["end"]
-            or pantry.get_setting(db, "skip_day") == day
-        ):
-            db.commit()
-            return None
-        rows = pantry.due_items(db, dt.date())
-        if not rows:
+        report, rows = reminder_status(db, dt, observation)
+        if report["in_window"] and not report["notice_state"]:
+            old = report["last_window_check"]
+            check = {
+                "day": day,
+                "time": report["time"],
+                "headline": report["headline"],
+                "reasons": list(report["reasons"].values()),
+            }
+            if not old or old != check:
+                pantry.put(db, "window_check", json.dumps(check, ensure_ascii=False))
+        if report["reasons"] or report["notice_state"]:
             db.commit()
             return None
         msg = "保质期提醒。" + pantry.summary(rows)
@@ -161,12 +223,14 @@ def reserve_summary(db, dt):
 
 
 def presence_loop():
+    global PRESENCE
     import gateway
 
     with closing(pantry.connect(DB)) as db:
         while True:
             try:
                 sample = gateway.read_sample()
+                PRESENCE = ("ok", sample)
                 state = {True: "厨房有人", False: "厨房无人", None: "暂无新鲜状态"}[
                     sample.occupied
                 ]
@@ -177,24 +241,27 @@ def presence_loop():
                 elif sample.occupied is None:
                     state += " · 等待设备连接"
                 status("presence", state)
-                if sample.occupied is True and sample.duration_minutes >= 2:
-                    dt = now()
-                    msg = reserve_summary(db, dt)
-                    if msg:
-                        delivery = "结果未确认"
-                        try:
-                            if say(msg):
-                                delivery = "音箱服务已受理"
-                        except Exception as exc:
-                            log_failure("output", exc)
-                        finally:
-                            with db:
-                                pantry.put(db, "recent_notice", str(time.time()))
-                                db.execute(
-                                    "UPDATE notices SET state=? WHERE day=?",
-                                    (delivery, dt.date().isoformat()),
-                                )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - isolate adapter/request failures without logging secrets
+                PRESENCE = ("error", None)
+                log_failure("presence", exc)
+            try:
+                dt = now()
+                msg = reserve_summary(db, dt, PRESENCE)
+                if msg:
+                    delivery = "结果未确认"
+                    try:
+                        if say(msg):
+                            delivery = "音箱服务已受理"
+                    except Exception as exc:  # noqa: BLE001 - isolate adapter/request failures without logging secrets
+                        log_failure("output", exc)
+                    finally:
+                        with db:
+                            pantry.put(db, "recent_notice", str(time.time()))
+                            db.execute(
+                                "UPDATE notices SET state=? WHERE day=?",
+                                (delivery, dt.date().isoformat()),
+                            )
+            except Exception as exc:  # noqa: BLE001 - isolate adapter/request failures without logging secrets
                 log_failure("presence", exc)
             time.sleep(15)
 
@@ -204,7 +271,19 @@ def inventory_csv(db, today):
     out = io.StringIO(newline="")
     writer = csv.writer(out, quoting=csv.QUOTE_ALL)
     writer.writerow(
-        ["批次", "名称", "数量", "单位", "存放位置", "日期用途", "日期", "状态"]
+        [
+            "批次",
+            "名称",
+            "数量",
+            "单位",
+            "存放位置",
+            "日期用途",
+            "日期",
+            "状态",
+            "生产日期",
+            "保质期数值",
+            "保质期单位",
+        ]
     )
     kinds = {"expiry": "到期日", "check": "查看日", "stock": "只记库存"}
     labels = {
@@ -234,6 +313,9 @@ def inventory_csv(db, today):
                 kinds[r["kind"]],
                 r["due"],
                 labels[r["status"]],
+                r["produced_on"],
+                r["shelf_value"] or "",
+                {"day": "天", "month": "月", "year": "年", "": ""}[r["shelf_unit"]],
             ]
         )
     return out.getvalue().encode("utf-8-sig")
@@ -286,7 +368,9 @@ class Handler(BaseHTTPRequestHandler):
         if not self.authenticated():
             return self.send(401, {"error": "请先连接家庭清单"})
         with closing(pantry.connect(DB)) as db:
-            today = now().date()
+            db.execute("BEGIN")
+            dt = now()
+            today = dt.date()
             if path == "/api/export.csv":
                 data = inventory_csv(db, today)
                 self.send_response(200)
@@ -318,6 +402,8 @@ class Handler(BaseHTTPRequestHandler):
                     "can_undo": can_undo,
                     "recent_changes": pantry.recent_changes(db),
                     "notice": dict(notice) if notice else None,
+                    "reminder_today": reminder_status(db, dt, PRESENCE)[0],
+                    "catalog": catalog.listing(db),
                 },
             )
 
@@ -336,7 +422,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send(400, {"error": "请求格式不正确"})
             body = json.loads(self.rfile.read(size))
             if not isinstance(body, dict):
-                raise ValueError()
+                raise TypeError()
             if self.path == "/api/login":
                 if not hmac.compare_digest(
                     str(body.get("token", "")).strip().encode(), TOKEN.encode()
@@ -369,6 +455,41 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError()
                 channel = "web:" + str(body.get("channel", "browser"))[:80]
                 if self.path == "/api/add":
+                    if "barcode" in body:
+                        code = body["barcode"]
+                        if (
+                            body.get("name")
+                            or not isinstance(code, str)
+                            or not catalog.barcode(catalog.key(code))
+                        ):
+                            raise catalog.InputError(
+                                "请提供已绑定的数字条码文本，商品名与条码二选一。"
+                            )
+                        body["name"] = code.strip()
+                    body.setdefault("unit", "")
+                    if (
+                        "produced_on" in body
+                        or "shelf_value" in body
+                        or "shelf_unit" in body
+                    ):
+                        if body.get("kind", "expiry") != "expiry" or body.get("due"):
+                            raise catalog.InputError(
+                                "请选择直接填写到期日，或填写生产日期和保质期。"
+                            )
+                        try:
+                            fields = pantry.shelf_fields(
+                                datetime.strptime(
+                                    body["produced_on"], "%Y-%m-%d"
+                                ).date(),
+                                body["shelf_value"],
+                                body["shelf_unit"],
+                                now().date(),
+                            )
+                        except (TypeError, KeyError, ValueError, OverflowError):
+                            raise catalog.InputError(
+                                "请填写有效的生产日期和正整数保质期，生产日期不能晚于今天。"
+                            ) from None
+                        body.update(fields)
                     item = {
                         field: body[field].strip()
                         for field in ("name", "unit", "kind", "due")
@@ -378,7 +499,7 @@ class Handler(BaseHTTPRequestHandler):
                     if (
                         len(item) != 4
                         or not 1 <= len(item["name"]) <= 60
-                        or not 1 <= len(item["unit"]) <= 8
+                        or len(item["unit"]) > 8
                         or type(qty) is not int
                         or not 1 <= qty <= 999
                         or item["kind"] not in ("stock", "check", "expiry")
@@ -393,11 +514,21 @@ class Handler(BaseHTTPRequestHandler):
                     elif item["due"]:
                         raise ValueError()
                     item["qty"] = qty
+                    if "produced_on" in body:
+                        item.update(fields)
                     item["location"] = pantry.location_name(body.get("location", ""))
                     msg, _ = pantry.transact(
                         db,
                         "web:" + key,
                         lambda: pantry.save_entries(db, [item], now().date(), channel),
+                    )
+                elif self.path == "/api/catalog":
+                    msg, _ = pantry.transact(
+                        db,
+                        "web:" + key,
+                        lambda: catalog.save(
+                            db, body, pantry.location_name(body.get("location", ""))
+                        ),
                     )
                 elif self.path == "/api/command":
                     raw = str(body["text"]).strip()
@@ -427,9 +558,12 @@ class Handler(BaseHTTPRequestHandler):
                         v = pantry.location_name(v)
                     elif op == "review_tomorrow":
                         v = now().date()
-                    elif op == "discard" and (type(v) is not int or v <= 0):
-                        raise ValueError()
-                    elif v is not None and int(v) <= 0:
+                    elif (
+                        op == "discard"
+                        and (type(v) is not int or v <= 0)
+                        or v is not None
+                        and int(v) <= 0
+                    ):
                         raise ValueError()
                     msg, _ = pantry.transact(
                         db,
@@ -439,6 +573,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     return self.send(404, {"error": "地址不存在"})
                 return self.send(200, {"reply": msg})
+        except catalog.InputError as exc:
+            return self.send(400, {"error": str(exc)})
         except (ValueError, TypeError, KeyError):
             return self.send(
                 400,
@@ -446,8 +582,8 @@ class Handler(BaseHTTPRequestHandler):
                     "error": "请检查日期、时间或数量。安静时段可通过允许播报的起止时间设置。"
                 },
             )
-        except Exception as exc:
-            logging.error("web: %s", type(exc).__name__)
+        except Exception as exc:  # noqa: BLE001 - isolate adapter/request failures without logging secrets
+            logging.getLogger(__name__).error("web: %s", type(exc).__name__)
             return self.send(500, {"error": "请求暂未完成，请刷新清单核对。"})
 
 

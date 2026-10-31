@@ -15,16 +15,26 @@ select{font:inherit;color:inherit;background:white;border:1px solid #b4c6b9;bord
 <header><small>小爱音箱 · 家庭库存</small><h1>保质期清单</h1></header>
 <section id="login" hidden><h2>连接家庭清单</h2><form class="flex" id="loginform"><input id="code" type="password" autocomplete="current-password" placeholder="输入家庭访问码" aria-label="家庭访问码" required><button class="primary">连接</button></form><p id="loginmsg" class="msg" role="status"></p></section>
 <div id="home" hidden>
-<section><h2>记一笔</h2><p class="muted">唤醒小爱后直接说「买了两盒酸奶，明天到期」。听到「已记录」或在清单看到商品，即表示登记成功。也可以在这里输入。</p><form class="flex" id="command"><input id="words" aria-label="库存指令" placeholder="菠菜，周日提醒我看看" maxlength="240" required><button class="primary">提交</button></form><p id="reply" class="msg" role="status"></p></section>
-<details><summary>填写商品入库</summary><form id="addform"><div class="fields">
+<section><h2>今天的主动提醒</h2><strong id="reminderHeadline"></strong><p id="reminderDetail" class="muted"></p><small id="windowCheck"></small></section>
+<section><h2>记一笔</h2><p class="muted">唤醒小爱后直接说，也可以在这里输入。例如「两盒牛奶，昨天生产，保质期七天」或「一袋面包明天到期，还有一盒酸奶后天到期」。多件同日可说「一袋面包和一盒酸奶，都明天到期」。</p><form class="flex" id="command"><input id="words" aria-label="库存指令" placeholder="菠菜，周日提醒我看看" maxlength="240" required><button class="primary">提交</button></form><p id="reply" class="msg" role="status"></p></section>
+<details id="entryPanel"><summary>填写商品入库</summary>
+<form class="flex" id="lookupform"><input id="lookupkey" maxlength="60" aria-label="查常买商品" placeholder="输入别名，或用扫码枪扫包装条码"><button>查商品</button></form><p id="lookupmsg" class="msg" role="status"></p>
+<form id="addform"><div class="fields">
 <label class="wide">名称<input id="itemname" required maxlength="60" placeholder="商品或物品名称"></label>
 <label class="narrow">数量<input id="itemqty" type="number" value="1" min="1" max="999" step="1" required></label>
 <label class="narrow">单位<input id="itemunit" value="件" maxlength="8" required></label>
 <label class="wide">存放位置（选填）<input id="itemlocation" list="places" maxlength="40" placeholder="例如：橱柜、卫生间"></label>
 <datalist id="places"></datalist>
-<label>日期用途<select id="itemkind"><option value="expiry">到期日</option><option value="check">提醒查看</option><option value="stock">只记库存</option></select></label>
+<label>日期用途<select id="itemkind"><option value="expiry">包装到期日</option><option value="shelf">生产日期 + 保质期</option><option value="check">提醒查看</option><option value="stock">只记库存</option></select></label>
 <label id="datelabel">日期<input id="itemdate" type="date" required></label>
+<div id="shelfform" class="fields" hidden><label>生产日期<input id="produced" type="date" disabled required></label><label class="narrow">保质期<input id="duration" type="number" min="1" step="1" disabled required></label><label>单位<select id="period"><option value="day">天</option><option value="month">月</option><option value="year">年</option></select></label><small id="shelfHint"></small></div>
 <button class="primary">保存入库</button></div><p class="msg" id="addmsg" role="status"></p></form></details>
+<details id="catalogPanel"><summary>常买商品 · 别名与条码</summary>
+<p class="muted">保存常买商品后，说别名也能记在同一商品名下。条码可手输或用扫码枪输入；日期仍按每次购买单独填写。</p>
+<div id="products"></div><form id="catForm"><div class="fields">
+<label class="wide">标准商品名<input id="catName" maxlength="60" required></label><label class="narrow">常用单位<input id="catUnit" maxlength="8" required value="件"></label><label>常放位置<input id="catPlace" list="places" maxlength="40"></label>
+<label class="wide">别名（逗号分隔）<input id="catAliases" placeholder="例如：小白奶、早餐奶"></label><label class="wide">包装条码（逗号分隔）<input id="catCodes" placeholder="保留开头的零"></label>
+<button class="primary">保存常买商品</button><button type="button" id="newProduct">新建 / 清空</button></div></form><p class="msg" id="catMsg" role="status"></p></details>
 <section><button id="attention" type="button">查看待处理库存</button><h2 id="count">在库商品</h2><div class="filters"><input type="search" id="finditem" aria-label="按名称搜索" placeholder="按名称搜索库存"><select id="placefilter" aria-label="按存放位置筛选"></select><select id="statusfilter" aria-label="按日期状态筛选"></select></div><div id="rows"></div><a href="/api/export.csv" download>导出全部库存 CSV</a> <button id="undo" hidden>撤销最近一次变更</button></section>
 <details><summary>最近 20 次库存变更</summary><div id="activity"></div></details>
 <details><summary>厨房提醒设置</summary><form id="settings"><label><input type="checkbox" id="enabled"> 开启主动播报</label><p class="muted">在允许的时段，厨房持续有人满 2 分钟时，汇总全家各处需要提醒的商品。已用完的商品会自动剔除，每天最多播一次。</p><div class="times"><label>从 <input type="time" id="start" required></label><label>到 <input type="time" id="end" required></label></div><label>到期前 <input type="number" min="0" max="90" id="lead" style="width:5em" required> 天开始提醒。查看日当天提醒。</label><button>保存设置</button><p class="msg" id="settingsmsg" role="status"></p></form></details>
@@ -70,6 +80,7 @@ function renderRows(){
  el("rows").replaceChildren();
  if(!rows.length)el("rows").append(node("p",view.rows.length?"没有符合当前条件的商品。":"清单是空的。可以告诉小爱，或在上方填写第一件商品。","muted"));
  for(const r of rows){const wrap=node("div","","item"),left=node("div",""),controls=node("div","","controls");left.append(node("strong",r.name+" · "+r.qty+r.unit));left.append(node("small",(r.location||"未指定位置")+" · "));left.append(node("small",r.kind==="stock"?"未设日期":r.due+" "+(r.kind==="expiry"?"到期":"查看")));if(["expired","today","soon","review"].includes(r.status))left.append(node("span",statuses[r.status],"badge "+r.status));
+ if(r.produced_on)left.append(node("small"," · "+r.produced_on+" 生产，保质期 "+r.shelf_value+({day:"天",month:"个月",year:"年"}[r.shelf_unit])));
  for(const [op,title] of [["consume","用掉"],["date",r.kind==="stock"?"设置到期日":"改期"],["location","改位置"],["discard","丢弃"]]){const b=node("button",title);b.onclick=()=>edit(r,op);controls.append(b)}
  if(r.status==="review"){
    const b=node("button","明天再看");
@@ -81,6 +92,10 @@ function renderRows(){
 el("attention").onclick=()=>{el("finditem").value="";el("placefilter").value="*";el("statusfilter").value="attention";renderRows()};
 el("placefilter").onchange=renderRows;el("finditem").oninput=renderRows;el("statusfilter").onchange=renderRows;
 async function refresh(){view=await api("/api/state");el("home").hidden=false;el("login").hidden=true;renderRows();renderHistory();
+ renderCatalog();el("produced").max=view.today;
+ const d=view.reminder_today;el("reminderHeadline").textContent=d.headline;
+ el("reminderDetail").textContent=d.time+" 检查 · "+d.due_count+" 批待提醒"+(d.notice_state?"":Object.values(d.reasons).filter(v=>v!==d.headline).map(v=>" · "+v).join(""));
+ const last=d.last_window_check;el("windowCheck").textContent=last?"允许时段内最近一次检查："+last.time+" · "+(last.reasons.join("；")||last.headline):"今天暂无允许时段内的检查记录。";
  el("undo").hidden=!(view.can_undo||undoAvailable);
  if(!settingsTouched){el("enabled").checked=view.settings.enabled==="1";el("start").value=view.settings.start;el("end").value=view.settings.end;el("lead").value=view.settings.lead_days}
  const diag=el("diagnostics");diag.replaceChildren();for(const [k,v] of Object.entries(view.devices)){diag.append(node("dt",voiceLabels[k]),node("dd",v))}diag.append(node("dt","最近语音指令"),node("dd",view.last_voice||"尚无记录"),node("dt","最近主动提醒"),node("dd",view.notice?view.notice.day+" · "+view.notice.state:"尚无记录"))}
@@ -90,9 +105,21 @@ async function login(token){await api("/api/login",{token});sessionStorage.setIt
 el("loginform").onsubmit=async e=>{e.preventDefault();try{await login(el("code").value.trim());el("code").value=""}catch(err){el("loginmsg").textContent=err.message}};
 const pendingRequests=new Map();
 async function mutate(path,body){const key=JSON.stringify([path,body]),id=pendingRequests.get(key)||unique();pendingRequests.set(key,id);const value=await api(path,{...body,id,channel});el("reply").textContent=value.reply;await refresh();pendingRequests.delete(key);return value}
-function syncDate(){const hidden=el("itemkind").value==="stock";el("datelabel").hidden=hidden;el("itemdate").disabled=hidden}
+function syncDate(){const kind=el("itemkind").value,shelf=kind==="shelf",hideDate=shelf||kind==="stock";el("datelabel").hidden=hideDate;el("itemdate").disabled=hideDate;el("shelfform").hidden=!shelf;el("produced").disabled=el("duration").disabled=!shelf;previewDate()}
+function previewDate(){const p=el("produced").value,n=Number(el("duration").value),u=el("period").value;
+ let hint="按生产日加上整段保质期计算。包装有明确到期日时，请直接填包装日期。";
+ if(p&&Number.isInteger(n)&&n>0&&n<={day:36500,month:1200,year:100}[u]&&p<=view.today){const d=new Date(p+"T00:00:00Z");if(u==="day")d.setUTCDate(d.getUTCDate()+n);else{const day=d.getUTCDate();d.setUTCDate(1);d.setUTCMonth(d.getUTCMonth()+n*(u==="year"?12:1)+1,0);d.setUTCDate(Math.min(day,d.getUTCDate()))}hint="计算到期日："+d.toISOString().slice(0,10)+"。以包装标注为准。"}el("shelfHint").textContent=hint}
+["produced","duration","period"].forEach(id=>el(id).oninput=previewDate);
 el("itemkind").onchange=syncDate;
-el("addform").onsubmit=async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{const r=await mutate("/api/add",{name:el("itemname").value.trim(),qty:Number(el("itemqty").value),unit:el("itemunit").value.trim(),location:el("itemlocation").value.trim(),kind:el("itemkind").value,due:el("itemdate").disabled?"":el("itemdate").value});e.target.reset();syncDate();el("addmsg").textContent=r.reply}catch(err){el("addmsg").textContent=err.message}finally{b.disabled=false}};
+el("addform").onsubmit=async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{const kind=el("itemkind").value,dates=kind==="shelf"?{kind:"expiry",produced_on:el("produced").value,shelf_value:Number(el("duration").value),shelf_unit:el("period").value}:{kind,due:el("itemdate").disabled?"":el("itemdate").value};const r=await mutate("/api/add",{name:el("itemname").value.trim(),qty:Number(el("itemqty").value),unit:el("itemunit").value.trim(),location:el("itemlocation").value.trim(),...dates});e.target.reset();syncDate();el("lookupform").reset();el("lookupmsg").textContent="";el("addmsg").textContent=r.reply}catch(err){el("addmsg").textContent=err.message}finally{b.disabled=false}};
+const splitKeys=s=>s.split(/[,，、;；]/).map(x=>x.trim()).filter(Boolean);
+const skuKey=s=>s.normalize("NFKC").trim().toLowerCase();
+function editProduct(p){el("catName").value=p.name;el("catName").readOnly=!!p.name;el("catUnit").value=p.unit;el("catPlace").value=p.location;el("catAliases").value=p.aliases.join("、");el("catCodes").value=p.barcodes.join("、");el("catMsg").textContent=""}
+el("newProduct").onclick=()=>editProduct({name:"",unit:"件",location:"",aliases:[],barcodes:[]});
+function chooseProduct(p){el("entryPanel").open=true;el("addform").reset();syncDate();el("itemname").value=p.name;el("itemunit").value=p.unit;el("itemlocation").value=p.location;el("lookupmsg").textContent="已带入 "+p.name+"，请填写本次购买的数量与日期。";el("itemqty").focus()}
+function renderCatalog(){const wrap=el("products");wrap.replaceChildren();for(const p of view.catalog){const row=node("div","","item"),info=node("div","");info.append(node("strong",p.name),node("small",[p.unit,p.location,...p.aliases,...p.barcodes].filter(Boolean).join(" · ")));const controls=node("div","","controls"),use=node("button","记一批"),edit=node("button","编辑");use.onclick=()=>chooseProduct(p);edit.onclick=()=>editProduct(p);controls.append(use,edit);row.append(info,controls);wrap.append(row)}}
+el("lookupform").onsubmit=e=>{e.preventDefault();const k=skuKey(el("lookupkey").value);const p=view.catalog.find(p=>[p.name,...p.aliases,...p.barcodes].some(v=>skuKey(v)===k));if(p){chooseProduct(p);return}el("lookupmsg").textContent="没有匹配的常买商品，请先登记标准名和条码。";if(/^(?:\d{8}|\d{12,14})$/.test(k)){el("catalogPanel").open=true;el("newProduct").click();el("catCodes").value=k;el("catName").focus()}};
+el("catForm").onsubmit=async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{const r=await mutate("/api/catalog",{name:el("catName").value.trim(),unit:el("catUnit").value.trim(),location:el("catPlace").value.trim(),aliases:splitKeys(el("catAliases").value),barcodes:splitKeys(el("catCodes").value)});el("newProduct").click();el("catMsg").textContent=r.reply}catch(err){el("catMsg").textContent=err.message}finally{b.disabled=false}};
 el("command").onsubmit=async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{await mutate("/api/command",{text:el("words").value});el("words").value=""}catch(err){el("reply").textContent=err.message}finally{b.disabled=false}};
 el("editform").onsubmit=async e=>{e.preventDefault();const b=e.submitter;b.disabled=true;try{await mutate("/api/batch",{batch:editing.r.id,op:editing.op,value:editing.op==="discard"?Number(el("editvalue").value):el("editvalue").value});el("edit").close()}catch(err){el("reply").textContent=err.message}finally{b.disabled=false}};
 el("undo").onclick=async()=>{if(confirm("撤销家庭清单最近一次库存变更？")){try{await mutate("/api/command",{text:"撤销"})}catch(err){el("reply").textContent=err.message}}};
